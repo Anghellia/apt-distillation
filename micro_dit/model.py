@@ -94,6 +94,7 @@ class LatentDiffusion(ComposerModel):
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         # freeze vae and text_encoder during training
+        self.dit.requires_grad_(True)
         self.text_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
         # avoid wrapping the models that we aren't training
@@ -141,15 +142,39 @@ class LatentDiffusion(ComposerModel):
         )
         return (loss, latents, conditioning)
 
-    def forward(self, noise, conditioning, t):
+    def forward(self, x, conditioning, device, sigma, final_step=False):
+        #rnd_normal = torch.randn([noise.shape[0], 1, 1, 1], device=device)
+        #T = (rnd_normal * config.P_std + config.P_mean).exp()
+        #loss = self.edm_loss(
+        #    noise.float(),
+        #    conditioning.float(),
+        #    mask_ratio=self.train_mask_ratio if self.training else self.eval_mask_ratio
+        #)
+        # Фиксируем  sigma = sigma_max (эквивалентно T=1000 в DDPM)
 
-        out_dict = self.dit.forward(
-            x=noise,
-            t=t,
-            y=conditioning,
-            cfg=7.5,
-            mask_ratio=0
+        if final_step:
+            sigma = torch.full([x.shape[0], 1, 1, 1], 5.65685424949238, device=device)
+            print("final step, sigma:", sigma)
+
+        n = self.randn_like(x) * sigma
+
+        out_dict = self.model_forward_wrapper(
+            x + n,
+            sigma,
+            conditioning,
+            self.dit,
+            mask_ratio=0,
+            cfg=7.5
+            #**kwargs
         )
+
+        #out_dict = self.dit.forward(
+        #    x=noise,
+        #    t=t,
+        #    y=conditioning,
+        #    cfg=7.5,
+        #    mask_ratio=0
+        #)
         latents = out_dict["sample"]  # [B,4,latent_res,latent_res]
         return latents
 
@@ -309,6 +334,38 @@ class LatentDiffusion(ComposerModel):
         return x_next.to(torch.float32)
 
     @torch.no_grad()
+    def edm_sampler_1step(
+        self, x: torch.Tensor,
+        y: torch.Tensor,
+        cfg: float = 1.0,
+        **kwargs
+    ) -> torch.Tensor:
+        mask_ratio = 0  # no masking during image generation
+        model_forward_fxn = (
+            partial(self.dit.forward, cfg=cfg) if cfg > 1.0
+            else self.dit.forward
+        )
+
+        # Используем только 1 шаг (max noise level)
+        t_cur = torch.full([x.shape[0], 1, 1, 1], 5.65685424949238, device=x.device)
+
+        # Добавляем шум (max noise)
+        x_noisy = x.to(torch.float64) * t_cur
+
+        # Forward step (единственный шаг)
+        denoised = self.model_forward_wrapper(
+            x_noisy.to(torch.float32),
+            t_cur.to(torch.float32),
+            y,
+            model_forward_fxn,
+            mask_ratio=mask_ratio,
+            **kwargs
+        )['sample'].to(torch.float64)
+
+        # Выход модели = предсказанная картинка
+        return denoised.to(torch.float32)
+
+    @torch.no_grad()
     def generate(
         self,
         prompt: Optional[list] = None,
@@ -346,13 +403,17 @@ class LatentDiffusion(ComposerModel):
         )
 
         # iteratively denoise latents
-        latents = self.edm_sampler_loop(
-            latents,
-            text_embeddings,
-            num_inference_steps,
+        #latents = self.edm_sampler_loop(
+        #    latents,
+        #    text_embeddings,
+        #    num_inference_steps,
+        #    cfg=guidance_scale
+        #)
+        latents = self.edm_sampler_1step(
+            x=latents,
+            y=text_embeddings,
             cfg=guidance_scale
         )
-
         if return_only_latents:
             return latents
 

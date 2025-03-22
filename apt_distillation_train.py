@@ -12,6 +12,8 @@ import argparse
 from torchvision import transforms
 import time
 
+import wandb
+
 from PIL import Image
 from micro_dit.model import create_latent_diffusion
 import gc
@@ -26,9 +28,10 @@ from omegaconf import OmegaConf
 from micro_dit.discriminator import APTDiscriminator, approximated_r1_loss, EMA
 from micro_dit.utils import DATA_TYPES
 
+wandb.init(project="APT_Training", name="APT_Distillation")
 
 BASE_CKPT_PATH = "/workspace/micro_diffusion/ckpts/dit_4_channel_37M_real_and_synthetic_data.pt"
-DISTILLED_CKPT_PATH = "/workspace/OmniHuman-1-hack/seaweed_apt/consistent_distilled_model_2/ema_model_epoch_1.pt"
+DISTILLED_CKPT_PATH = "/workspace/micro_diffusion/ckpts/dit_4_channel_37M_real_and_synthetic_data.pt"
 
 def load_original_model(device, ckpt_path: str = BASE_CKPT_PATH):
     logger.debug(f"Loading micro-DiT model...")
@@ -78,14 +81,30 @@ def run_apt_distillation(config, train_dataloader, output_dir, device, accelerat
     torch.cuda.manual_seed_all(config.seed)
 
     original_model = load_original_model(device)
-    generator = load_distilled_model(device)
+    generator = load_original_model(device)
 
     discriminator = APTDiscriminator(original_model)
-    generator.requires_grad_(True)
-    discriminator.requires_grad_(True)
 
-    g_optimizer = optim.RMSprop(generator.parameters(), lr=config.g_lr, alpha=0.9)
-    d_optimizer = optim.RMSprop(discriminator.parameters(), lr=config.d_lr, alpha=0.9)
+    #generator.requires_grad_(True)
+    #discriminator.requires_grad_(True)
+
+    for param in generator.dit.parameters():
+        param.requires_grad = True
+
+    for param in discriminator.backbone.dit.parameters():
+        param.requires_grad = True
+
+    generator.train()
+    discriminator.train()
+
+    #print([p for p in generator.parameters() if p.requires_grad])
+    #print([p for p in discriminator.parameters() if p.requires_grad])
+
+    g_optimizer = optim.RMSprop([p for p in generator.dit.parameters() if p.requires_grad], lr=config.g_lr, alpha=0.9)
+    d_optimizer = optim.RMSprop([p for p in discriminator.backbone.dit.parameters() if p.requires_grad], lr=config.d_lr, alpha=0.9)
+
+    print([name for name, value in generator.named_parameters() if value.requires_grad])
+    print([name for name, value in discriminator.named_parameters() if value.requires_grad])
 
     generator, discriminator, g_optimizer, d_optimizer, train_dataloader = accelerator.prepare(
         generator, discriminator, g_optimizer, d_optimizer, train_dataloader
@@ -102,6 +121,7 @@ def run_apt_distillation(config, train_dataloader, output_dir, device, accelerat
         for batch_idx, batch in enumerate(tqdm(train_dataloader)):
 
             step_output = apt_training_step(
+                global_step=global_step,
                 batch=batch,
                 config=config,
                 device=device,
@@ -141,6 +161,34 @@ def run_apt_distillation(config, train_dataloader, output_dir, device, accelerat
                 'epoch': epoch
                 }, os.path.join(checkpoint_dir, "pytorch_model.bin"))
 
+
+                prompts = [
+                    "a full body shot of a beautiful young goth woman with white hair and blue eyes with a subtle smile, double arm amputee, dsd, double-shoulder disarticulation, armless, no arms, wearing black leather corsette, intricate, high detail, 8k",
+                    "desert landscape with dunes and hills, multi dimensional paper cut craft, persian ambience, an evil djinn emerging from sand, wind blowin, paper illustration, sand storm, ornate, detailed, golden ratio",
+                    "miniature disney santa's village, christmas, in lights, under a christmas tree, photorealistic, mood lighting, tilt shift photography",
+                    "cinematic, realistic, 1920s girls at college, girls studying, university, dark academia, ghost story, horror, haunted, creepy"
+                    ]
+                gen_images = generator.generate(
+                    prompt=prompts,
+                    num_inference_steps=1,
+                    guidance_scale=7.5,
+                    seed=2131
+                )
+                image_list = []
+                for idx, img_tensor in enumerate(gen_images):
+                    img_tensor = (img_tensor.clamp(0, 1) * 255).byte().cpu()
+                    img_pil = Image.fromarray(img_tensor.permute(1, 2, 0).numpy())
+                    image_list.append(wandb.Image(img_pil, caption=f"Prompt {idx+1}"))
+
+                wandb.log({
+                    "Generator Loss": g_loss,
+                    "Discriminator Loss": d_loss,
+                    "Generated Sample": image_list
+                })
+
+                for idx, img_pil in enumerate(image_list):
+                    img_pil.image.save(f"{output_dir}/generated_sample_step_{global_step}_prompt_{idx+1}.png")
+
         # Save epoch checkpoint
         epoch_checkpoint_dir = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}")
         os.makedirs(epoch_checkpoint_dir, exist_ok=True)
@@ -170,7 +218,7 @@ def run_apt_distillation(config, train_dataloader, output_dir, device, accelerat
     return ema.model
 
 
-def apt_training_step(batch, config, device, accelerator, generator, discriminator, d_optimizer, g_optimizer):
+def apt_training_step(global_step, batch, config, device, accelerator, generator, discriminator, d_optimizer, g_optimizer):
     image, caption = batch
     image = image.to(device)
 
@@ -184,39 +232,37 @@ def apt_training_step(batch, config, device, accelerator, generator, discriminat
     conditioning = generator.text_encoder.encode(tokenized_prompts.to(device))[0]
 
 
-    T = torch.ones(noise.shape[0], device=device) * config.num_train_timesteps
-
-    t = torch.rand(noise.shape[0], device=device) * config.num_train_timesteps
-    s = 1.0
-    t_shifted = s * t / (1.0 + (s - 1.0) * t)
+    rnd_normal = torch.randn([noise.shape[0], 1, 1, 1], device=device)
+    sigma = (rnd_normal * generator.edm_config.P_std + generator.edm_config.P_mean).exp()
 
     # Train discriminator
     with torch.no_grad():
-        fake_image = generator(noise, conditioning, T)
+        fake_image = generator(image_vae, conditioning, device, sigma, final_step=True)
 
-    real_logits = discriminator(image_vae, conditioning, t_shifted)
-    fake_logits = discriminator(fake_image, conditioning, t_shifted)
+    real_logits = discriminator(image_vae, conditioning, device, sigma)
+    fake_logits = discriminator(fake_image, conditioning, device, sigma)
 
     d_loss_real = -torch.log(torch.sigmoid(real_logits) + 1e-8).mean()
     d_loss_fake = -torch.log(1.0 - torch.sigmoid(fake_logits) + 1e-8).mean()
     d_loss = d_loss_real + d_loss_fake
 
-    r1_loss = approximated_r1_loss(discriminator, image_vae, t_shifted, conditioning, sigma=0.01)
+    r1_loss = approximated_r1_loss(discriminator, image_vae, device, sigma, conditioning)
     d_loss = d_loss + config.lambda_r1 * r1_loss
 
-    # Update discriminator
+    #if global_step % 2 == 0:
+        # Update discriminator
     d_optimizer.zero_grad()
-    accelerator.backward(d_loss)
+    accelerator.backward(d_loss, retain_graph=True)
     d_optimizer.step()
 
     # Train generator
-    fake_image = generator(noise, conditioning, T)
-
-    fake_logits = discriminator(fake_image, conditioning, t_shifted)
+    fake_image = generator(image_vae, conditioning, device, sigma, final_step=True)
+    fake_logits = discriminator(fake_image, conditioning, device, sigma)
     g_loss = -torch.log(torch.sigmoid(fake_logits) + 1e-8).mean()
 
-    # Update generator
     g_optimizer.zero_grad()
+
+    # Update generator
     accelerator.backward(g_loss)
     g_optimizer.step()
 
@@ -234,14 +280,14 @@ class Config:
 
         # Training configuration
         self.num_epochs = 10
-        self.save_interval = 350
-        self.g_lr = 5e-6
-        self.d_lr = 5e-6
+        self.save_interval = 200
+        self.g_lr = 5 #5e-2
+        self.d_lr = 5 #1e-2
 
         self.ema_decay = 0.995
-        self.lambda_r1 = 100.0
+        self.lambda_r1 = 100
 
-        self.seed = 42
+        self.seed = 123213
 
 
 def resize_to_multiple_of_32(image):
@@ -295,14 +341,14 @@ class TextImageDataset(Dataset):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="APT distillation training")
     parser.add_argument("--dataset_dir", type=str, default="./dataset_path", help="Dataset directory with image, text pairs")
-    parser.add_argument("--output_dir", type=str, default="./apt_final_model_exp1", help="Output directory for saving checkpoints")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--output_dir", type=str, default="./apt_final_model_exp2", help="Output directory for saving checkpoints")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     args = parser.parse_args()
 
     # Create config object
     config = Config()
 
-    accelerator = Accelerator(mixed_precision="bf16")
+    accelerator = Accelerator()
     device = accelerator.device
 
     args.dataset_dir = "/workspace/micro_diffusion/micro_diffusion/datasets/prepare/jdb/output_jdb"
