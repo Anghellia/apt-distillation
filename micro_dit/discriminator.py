@@ -58,7 +58,7 @@ class DiscriminatorCrossAttnBlock(nn.Module):
 
 
 class APTDiscriminator(nn.Module):
-    def __init__(self, dit_model):
+    def __init__(self, dit_model, use_checkpoint: bool = False):
         super().__init__()
 
         self.backbone = copy.deepcopy(dit_model)
@@ -91,7 +91,7 @@ class APTDiscriminator(nn.Module):
             nn.Linear(self.dim * 3, 1)
         )
 
-    def forward(self, noise, conditioning, t, return_features=False):
+    def forward(self, noise, conditioning, device, sigma, final_step=False, return_features=False):
         layer_outputs = {}
 
         def hook_fn_15(module, inp, out):
@@ -105,13 +105,14 @@ class APTDiscriminator(nn.Module):
         h2 = self.backbone.dit.blocks[25].register_forward_hook(hook_fn_25)
         h3 = self.backbone.dit.blocks[27].register_forward_hook(hook_fn_27)
 
+
         with torch.no_grad():
-            self.backbone.dit.forward(
-                x=noise,
-                t=t,
-                y=conditioning,
-                mask_ratio=0,
-                cfg=7.5
+            self.backbone.forward(
+                noise,
+                conditioning, device, sigma,
+                final_step=final_step
+                #mask_ratio=0,
+                #cfg=7.5
             )
         h1.remove()
         h2.remove()
@@ -135,20 +136,21 @@ class APTDiscriminator(nn.Module):
 
         if return_features:
             return logit, (feat_15_out, feat_25_out, feat_27_out)
-        return logit
+        else:
+            return logit
 
-def approximated_r1_loss(discriminator, real_image, timestep, conditioning, sigma=0.01):
+def approximated_r1_loss(discriminator, real_image, device, sigma, conditioning):
     # Get discriminator prediction on real samples
-    real_pred = discriminator(real_image, conditioning, timestep)
+    real_pred = discriminator(real_image, conditioning, device, sigma, final_step=False)
     # Add small Gaussian perturbation to real samples
-    perturbed_samples = real_image + torch.randn_like(real_image) * sigma
+    perturbed_samples = real_image + torch.randn_like(real_image) * 0.01
 
-    perturbed_pred = discriminator(perturbed_samples, conditioning, timestep)
+    perturbed_pred = discriminator(perturbed_samples, conditioning, device, sigma, final_step=False)
     loss = torch.mean((real_pred - perturbed_pred) ** 2)
     return loss
 
 class EMA:
-    def __init__(self, model, decay=0.9995):
+    def __init__(self, model, decay=0.9999):
         self.model = copy.deepcopy(model)
         self.decay = decay
 
